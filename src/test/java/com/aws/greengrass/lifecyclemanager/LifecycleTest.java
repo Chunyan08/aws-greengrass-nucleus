@@ -56,9 +56,7 @@ import static com.aws.greengrass.lifecyclemanager.GreengrassService.RUNTIME_STOR
 import static com.aws.greengrass.lifecyclemanager.Lifecycle.STATE_TOPIC_NAME;
 import static com.github.grantwest.eventually.EventuallyLambdaMatcher.eventuallyEval;
 import static org.hamcrest.MatcherAssert.assertThat;
-import static org.hamcrest.Matchers.in;
 import static org.hamcrest.Matchers.is;
-import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -67,7 +65,6 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
-import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 @ExtendWith({MockitoExtension.class, GGExtension.class})
@@ -179,7 +176,6 @@ class LifecycleTest {
         context.get(ExecutorService.class).awaitTermination(5, TimeUnit.SECONDS);
         context.get(ScheduledExecutorService.class).awaitTermination(5, TimeUnit.SECONDS);
     }
-
     @Test
     void GIVEN_state_new_WHEN_requestStart_called_THEN_install_invoked() throws InterruptedException {
         lifecycle = new Lifecycle(greengrassService, logger, greengrassService.getPrivateConfig());
@@ -195,67 +191,28 @@ class LifecycleTest {
     }
 
     @Test
-    void GIVEN_state_new_WHEN_interrupt_during_install_THEN_shutdown_normally() throws InterruptedException {
-        // GIVEN
-        lifecycle = spy(new Lifecycle(greengrassService, logger, greengrassService.getPrivateConfig()));
+    void GIVEN_state_new_WHEN_requestStop_called_THEN_shutdown_normally() throws InterruptedException {
+        lifecycle = new Lifecycle(greengrassService, logger, greengrassService.getPrivateConfig());
         initLifecycleState(lifecycle, State.NEW);
 
         CountDownLatch installInterrupted = new CountDownLatch(1);
         Mockito.doAnswer((mock) -> {
-            System.out.println("11111");
             try {
                 Thread.sleep(2000);
             } catch (InterruptedException e) {
-                e.printStackTrace();
-                System.out.println("22222");
                 installInterrupted.countDown();
-                System.out.println("installInterrupted count " + installInterrupted.getCount());
             }
             return null;
         }).when(greengrassService).install();
 
-        CountDownLatch shutdownCalledLatch = new CountDownLatch(1);
-        Mockito.doAnswer((mock) -> {
-            System.out.println("33333");
-            shutdownCalledLatch.countDown();
-            System.out.println("shutdownCalledLatch count " + installInterrupted.getCount());
-            return null;
-        }).when(greengrassService).shutdown();
-
-        //Gets the final install status
-        CountDownLatch finalStatusUpdated = new CountDownLatch(1);
-        AtomicReference<ComponentStatusDetails> statusDetails = new AtomicReference<>();
-        //这里的service是指的lifecycle?
-        context.addGlobalStateChangeListener((service, old, newState) -> {
-            if (newState.equals(State.ERRORED)) {
-                statusDetails.set(lifecycle.getStatusDetails());
-                finalStatusUpdated.countDown();
-            }
-        });
-
         lifecycle.initLifecycleThread();
         lifecycle.requestStart();
+        verify(greengrassService,timeout(2000).atLeastOnce()).install();
 
-        // WHEN
         lifecycle.requestStop();
 
-        assertThat(shutdownCalledLatch.await(5000, TimeUnit.MILLISECONDS), is(true));
-        assertThat(shutdownCalledLatch.await(5000, TimeUnit.MILLISECONDS), is(true));
-
-        verify(greengrassService).install();
-        verify(greengrassService).shutdown();
-
-        //THEN
-        assertAll("result check: ",
-                () -> assertThat(shutdownCalledLatch.await(1000, TimeUnit.MILLISECONDS), is(true)),
-                () -> assertThat(installInterrupted.await(1000, TimeUnit.MILLISECONDS), is(true)),
-                () -> assertThat(finalStatusUpdated.await(1000, TimeUnit.MILLISECONDS), is(true)),
-                //verify that greengrassService.install() is an interruptible, blocking task.
-                //STATUS_DETAIL_STARTUP_ERRORED  or STATUS_DETAIL_RUN_ERRORED  ????
-                () -> assertThat(statusDetails.get(), is(STATUS_DETAIL_RUN_ERRORED)),
-                //vertify greengrass service final state = FINISHED
-                () -> verify(lifecycle, timeout(1000)).setState(any(), eq(STATE_TRANSITION_FINISHED))
-        );
+        verify(greengrassService,timeout(2000)).shutdown();
+        assertThat(installInterrupted.await(1000, TimeUnit.MILLISECONDS), is(true));
     }
 
     @Test
