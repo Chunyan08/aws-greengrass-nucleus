@@ -56,7 +56,9 @@ import static com.aws.greengrass.lifecyclemanager.GreengrassService.RUNTIME_STOR
 import static com.aws.greengrass.lifecyclemanager.Lifecycle.STATE_TOPIC_NAME;
 import static com.github.grantwest.eventually.EventuallyLambdaMatcher.eventuallyEval;
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.in;
 import static org.hamcrest.Matchers.is;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -65,6 +67,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
 @ExtendWith({MockitoExtension.class, GGExtension.class})
@@ -75,13 +78,13 @@ class LifecycleTest {
 
     private static final String BLANK_CONFIG_YAML_WITH_TIMEOUT =
             "---\n"
-            + "lifecycle:\n"
-            + "  install:\n"
-            + "    timeout: 1\n"
-            + "  startup:\n"
-            + "    timeout: 1\n"
-            + "  shutdown:\n"
-            + "    timeout: 1\n";
+                    + "lifecycle:\n"
+                    + "  install:\n"
+                    + "    timeout: 1\n"
+                    + "  startup:\n"
+                    + "    timeout: 1\n"
+                    + "  shutdown:\n"
+                    + "    timeout: 1\n";
 
     private static final Integer DEFAULT_TEST_TIMEOUT = 1;
 
@@ -121,6 +124,11 @@ class LifecycleTest {
             .newState(State.BROKEN)
             .statusCode(ComponentStatusCode.RUN_ERROR)
             .statusReason(ComponentStatusCode.RUN_ERROR.getDescription())
+            .build();
+    private static final Lifecycle.StateTransitionEvent STATE_TRANSITION_ERRORED = Lifecycle.StateTransitionEvent.builder()
+            .newState(State.ERRORED)
+            .statusCode(ComponentStatusCode.INSTALL_ERROR)
+            .statusReason(ComponentStatusCode.INSTALL_ERROR.getDescription())
             .build();
 
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -184,6 +192,70 @@ class LifecycleTest {
         verify(greengrassService, timeout(1000)).startup();
         assertEquals(State.STARTING, lifecycle.getState());
         assertThat(lifecycle.getStatusDetails(), is(STATUS_DETAIL_HEALTHY));
+    }
+
+    @Test
+    void GIVEN_state_new_WHEN_interrupt_during_install_THEN_shutdown_normally() throws InterruptedException {
+        // GIVEN
+        lifecycle = spy(new Lifecycle(greengrassService, logger, greengrassService.getPrivateConfig()));
+        initLifecycleState(lifecycle, State.NEW);
+
+        CountDownLatch installInterrupted = new CountDownLatch(1);
+        Mockito.doAnswer((mock) -> {
+            System.out.println("11111");
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+                System.out.println("22222");
+                installInterrupted.countDown();
+                System.out.println("installInterrupted count " + installInterrupted.getCount());
+            }
+            return null;
+        }).when(greengrassService).install();
+
+        CountDownLatch shutdownCalledLatch = new CountDownLatch(1);
+        Mockito.doAnswer((mock) -> {
+            System.out.println("33333");
+            shutdownCalledLatch.countDown();
+            System.out.println("shutdownCalledLatch count " + installInterrupted.getCount());
+            return null;
+        }).when(greengrassService).shutdown();
+
+        //Gets the final install status
+        CountDownLatch finalStatusUpdated = new CountDownLatch(1);
+        AtomicReference<ComponentStatusDetails> statusDetails = new AtomicReference<>();
+        //这里的service是指的lifecycle?
+        context.addGlobalStateChangeListener((service, old, newState) -> {
+            if (newState.equals(State.ERRORED)) {
+                statusDetails.set(lifecycle.getStatusDetails());
+                finalStatusUpdated.countDown();
+            }
+        });
+
+        lifecycle.initLifecycleThread();
+        lifecycle.requestStart();
+
+        // WHEN
+        lifecycle.requestStop();
+
+        assertThat(shutdownCalledLatch.await(5000, TimeUnit.MILLISECONDS), is(true));
+        assertThat(shutdownCalledLatch.await(5000, TimeUnit.MILLISECONDS), is(true));
+
+        verify(greengrassService).install();
+        verify(greengrassService).shutdown();
+
+        //THEN
+        assertAll("result check: ",
+                () -> assertThat(shutdownCalledLatch.await(1000, TimeUnit.MILLISECONDS), is(true)),
+                () -> assertThat(installInterrupted.await(1000, TimeUnit.MILLISECONDS), is(true)),
+                () -> assertThat(finalStatusUpdated.await(1000, TimeUnit.MILLISECONDS), is(true)),
+                //verify that greengrassService.install() is an interruptible, blocking task.
+                //STATUS_DETAIL_STARTUP_ERRORED  or STATUS_DETAIL_RUN_ERRORED  ????
+                () -> assertThat(statusDetails.get(), is(STATUS_DETAIL_RUN_ERRORED)),
+                //vertify greengrass service final state = FINISHED
+                () -> verify(lifecycle, timeout(1000)).setState(any(), eq(STATE_TRANSITION_FINISHED))
+        );
     }
 
     @Test
@@ -550,17 +622,17 @@ class LifecycleTest {
         assertTrue(testService.getDependencies().containsKey(dependencyService));
         CountDownLatch serviceStarted = new CountDownLatch(1);
         testService.setStartupRunnable(
-            () -> {
-                try {
-                    serviceStarted.countDown();
-                    Thread.sleep(10_000);
-                } catch (InterruptedException ie) {
-                    return;
+                () -> {
+                    try {
+                        serviceStarted.countDown();
+                        Thread.sleep(10_000);
+                    } catch (InterruptedException ie) {
+                        return;
+                    }
                 }
-            }
         );
         dependencyService.setStartupRunnable(
-            () -> dependencyService.reportState(State.RUNNING)
+                () -> dependencyService.reportState(State.RUNNING)
         );
 
         // init lifecycle
@@ -670,13 +742,13 @@ class LifecycleTest {
 
         CountDownLatch configUpdateFinished = new CountDownLatch(1);
         testService.setStartupRunnable(() -> {
-                if (configUnderUpdate.get()) {
-                    assertEquals(newConfig, config.toPOJO());
-                    configUnderUpdate.set(false);
-                    configUpdateFinished.countDown();
-                }
-                testService.reportState(State.RUNNING);
-            });
+            if (configUnderUpdate.get()) {
+                assertEquals(newConfig, config.toPOJO());
+                configUnderUpdate.set(false);
+                configUpdateFinished.countDown();
+            }
+            testService.reportState(State.RUNNING);
+        });
 
         // init lifecycle
         testService.postInject();
@@ -689,15 +761,17 @@ class LifecycleTest {
 
         config.updateMap(newConfig,
                 new UpdateBehaviorTree(UpdateBehaviorTree.UpdateBehavior.MERGE, Integer.MAX_VALUE));
-        assertTrue(configUpdateFinished.await(2 , TimeUnit.SECONDS), "updated config:" + config.toPOJO().toString());
+        assertTrue(configUpdateFinished.await(2, TimeUnit.SECONDS), "updated config:" + config.toPOJO().toString());
     }
 
     private class TestService extends GreengrassService {
         @Setter
-        private Runnable startupRunnable = () -> {};
+        private Runnable startupRunnable = () -> {
+        };
 
         @Setter
-        private Runnable shutdownRunnable = () -> {};
+        private Runnable shutdownRunnable = () -> {
+        };
 
         TestService(Topics topics) {
             super(topics);
